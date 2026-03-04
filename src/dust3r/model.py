@@ -107,6 +107,8 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         patch_embed_cls="PatchEmbedDust3R",
         ray_enc_depth=2,
         state_size=324,
+        frame_state_size=324,
+        frame_state_mode="fixed",
         local_mem_size=256,
         state_pe="2d",
         state_dec_num_heads=16,
@@ -127,6 +129,8 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.patch_embed_cls = patch_embed_cls
         self.ray_enc_depth = ray_enc_depth
         self.state_size = state_size
+        self.frame_state_size = frame_state_size
+        self.frame_state_mode = frame_state_mode
         self.state_pe = state_pe
         self.state_dec_num_heads = state_dec_num_heads
         self.local_mem_size = local_mem_size
@@ -270,8 +274,25 @@ class ARCroco3DStereo(CroCoNet):
                 rope=None,
             )
         self.register_tokens = nn.Embedding(config.state_size, self.enc_embed_dim)
+        self.frame_register_tokens = nn.Embedding(
+            config.frame_state_size, self.enc_embed_dim
+        )
         self.state_size = config.state_size
+        self.frame_state_size = config.frame_state_size
+        self.frame_state_mode = config.frame_state_mode
         self.state_pe = config.state_pe
+        if self.frame_state_mode in ["image", "state"]:
+            self.frame_state_dec = DecoderBlock(
+                self.dec_embed_dim,
+                config.state_dec_num_heads,
+                mlp_ratio=self.croco_args.get("mlp_ratio", None),
+                qkv_bias=True,
+                norm_layer=self.croco_args.get("norm_layer", None),
+                norm_mem=self.croco_args.get("norm_im2_in_dec", None),
+                rope=self.rope,
+            )
+        else:
+            self.frame_state_dec = nn.Identity()
         self.masked_img_token = nn.Parameter(
             torch.randn(1, self.enc_embed_dim) * 0.02, requires_grad=True
         )
@@ -457,6 +478,8 @@ class ARCroco3DStereo(CroCoNet):
                 self.pose_retriever,
                 self.pose_token,
                 self.register_tokens,
+                self.frame_register_tokens,
+                self.frame_state_dec,
                 self.decoder_embed_state,
                 self.decoder_embed,
                 self.dec_norm,
@@ -467,6 +490,7 @@ class ARCroco3DStereo(CroCoNet):
                 self.dec_blocks_state,
                 self.pose_retriever,
                 self.pose_token,
+                self.frame_state_dec,
             ],
         }
         freeze_all_params(to_be_frozen[freeze])
@@ -540,32 +564,100 @@ class ARCroco3DStereo(CroCoNet):
         state_feat = self.register_tokens(
             torch.arange(self.state_size, device=image_pos.device)
         )
+        state_pos = self._build_state_pos(
+            self.state_size, batch_size, image_pos.device, image_pos.dtype
+        )
+        state_feat = state_feat[None].expand(batch_size, -1, -1)
+        return state_feat, state_pos, None
+
+    def _build_state_pos(self, size, batch_size, device, dtype, time_step=0):
         if self.state_pe == "1d":
             state_pos = (
                 torch.tensor(
-                    [[i, i] for i in range(self.state_size)],
-                    dtype=image_pos.dtype,
-                    device=image_pos.device,
+                    [[i, i] for i in range(size)],
+                    dtype=dtype,
+                    device=device,
                 )[None]
                 .expand(batch_size, -1, -1)
                 .contiguous()
             )  # .long()
-        elif self.state_pe == "2d":
-            width = int(self.state_size**0.5)
+        elif self.state_pe in ["2d", "3d"]:
+            width = int(size**0.5)
             width = width + 1 if width % 2 == 1 else width
-            state_pos = (
-                torch.tensor(
-                    [[i // width, i % width] for i in range(self.state_size)],
-                    dtype=image_pos.dtype,
-                    device=image_pos.device,
-                )[None]
-                .expand(batch_size, -1, -1)
-                .contiguous()
-            )
+            if self.state_pe == "3d":
+                state_pos = (
+                    torch.tensor(
+                        [[time_step, i // width, i % width] for i in range(size)],
+                        dtype=dtype,
+                        device=device,
+                    )[None]
+                    .expand(batch_size, -1, -1)
+                    .contiguous()
+                )
+            else:
+                state_pos = (
+                    torch.tensor(
+                        [[i // width, i % width] for i in range(size)],
+                        dtype=dtype,
+                        device=device,
+                    )[None]
+                    .expand(batch_size, -1, -1)
+                    .contiguous()
+                )
         elif self.state_pe == "none":
             state_pos = None
-        state_feat = state_feat[None].expand(batch_size, -1, -1)
-        return state_feat, state_pos, None
+        return state_pos
+
+    def _augment_state_tokens(
+        self,
+        state_feat,
+        state_pos,
+        current_feat,
+        current_pos,
+    ):
+        batch_size = state_feat.shape[0]
+        token_ids = torch.arange(self.frame_state_size, device=state_feat.device)
+
+        frame_tokens = self.frame_register_tokens(token_ids)
+        frame_tokens = self.decoder_embed_state(frame_tokens)[None].expand(
+            batch_size, -1, -1
+        )
+        frame_pos = self._build_state_pos(
+            self.frame_state_size,
+            batch_size,
+            state_feat.device,
+            state_pos.dtype if state_pos is not None else current_pos.dtype,
+            time_step=0,
+        )
+
+        if state_pos is None:
+            state_pos_for_dec = None
+        elif self.state_pe == "3d":
+            state_pos_for_dec = state_pos.clone()
+            state_pos_for_dec[..., 0] = state_pos_for_dec[..., 0] + 1
+        else:
+            state_pos_for_dec = state_pos
+
+        if self.frame_state_mode == "image":
+            image_feat = self.decoder_embed(current_feat)
+            frame_tokens, _ = self.frame_state_dec(
+                frame_tokens, image_feat, frame_pos, current_pos
+            )
+        elif self.frame_state_mode == "state":
+            frame_tokens, _ = self.frame_state_dec(
+                frame_tokens, state_feat, frame_pos, state_pos_for_dec
+            )
+        elif self.frame_state_mode != "fixed":
+            raise ValueError(
+                f"Unknown frame_state_mode={self.frame_state_mode}, expected one of ['fixed', 'image', 'state']"
+            )
+
+        aug_state_feat = torch.cat([state_feat, frame_tokens], dim=1)
+        if state_pos_for_dec is None:
+            aug_state_pos = None
+        else:
+            aug_state_pos = torch.cat([state_pos_for_dec, frame_pos], dim=1)
+        return aug_state_feat, aug_state_pos
 
     def _encode_views(self, views, img_mask=None, ray_mask=None):
         device = views[0]["img"].device
@@ -723,14 +815,39 @@ class ARCroco3DStereo(CroCoNet):
         reset_mask=None,
         update=None,
     ):
+        state_feat_aug, state_pos_aug = self._augment_state_tokens(
+            state_feat,
+            state_pos,
+            current_feat,
+            current_pos,
+        )
         new_state_feat, dec = self._decoder(
-            state_feat, state_pos, current_feat, current_pos, pose_feat, pose_pos
+            state_feat_aug,
+            state_pos_aug,
+            current_feat,
+            current_pos,
+            pose_feat,
+            pose_pos,
         )
         new_state_feat = new_state_feat[-1]
-        return new_state_feat, dec
+        return new_state_feat, state_pos_aug, dec
 
     def _get_img_level_feat(self, feat):
         return torch.mean(feat, dim=1, keepdim=True)
+
+    def _blend_state_feat(self, new_state_feat, old_state_feat, mask):
+        if old_state_feat.shape[1] < new_state_feat.shape[1]:
+            pad = torch.zeros(
+                old_state_feat.shape[0],
+                new_state_feat.shape[1] - old_state_feat.shape[1],
+                old_state_feat.shape[2],
+                device=old_state_feat.device,
+                dtype=old_state_feat.dtype,
+            )
+            old_state_feat = torch.cat([old_state_feat, pad], dim=1)
+        elif old_state_feat.shape[1] > new_state_feat.shape[1]:
+            old_state_feat = old_state_feat[:, : new_state_feat.shape[1]]
+        return new_state_feat * mask + old_state_feat * (1 - mask)
 
     def _forward_encoder(self, views):
         shape, feat_ls, pos = self._encode_views(views)
@@ -772,7 +889,7 @@ class ARCroco3DStereo(CroCoNet):
         else:
             pose_feat_i = None
             pose_pos_i = None
-        new_state_feat, dec = self._recurrent_rollout(
+        new_state_feat, new_state_pos, dec = self._recurrent_rollout(
             state_feat,
             state_pos,
             feat_i,
@@ -802,14 +919,21 @@ class ARCroco3DStereo(CroCoNet):
         else:
             update_mask = img_mask
         update_mask = update_mask[:, None, None].float()
-        state_feat = new_state_feat * update_mask + state_feat * (
-            1 - update_mask
+        state_feat = self._blend_state_feat(
+            new_state_feat, state_feat, update_mask
         )  # update global state
+        state_pos = new_state_pos
         mem = new_mem * update_mask + mem * (1 - update_mask)  # then update local state
         reset_mask = views[i]["reset"]
         if reset_mask is not None:
             reset_mask = reset_mask[:, None, None].float()
-            state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
+            state_feat = self._blend_state_feat(init_state_feat, state_feat, reset_mask)
+            state_pos = self._build_state_pos(
+                state_feat.shape[1],
+                state_feat.shape[0],
+                state_feat.device,
+                state_pos.dtype if state_pos is not None else views[i]["img"].dtype,
+            )
             mem = init_mem * reset_mask + mem * (1 - reset_mask)
         return res, (state_feat, mem)
 
@@ -837,7 +961,7 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 pose_feat_i = None
                 pose_pos_i = None
-            new_state_feat, dec = self._recurrent_rollout(
+            new_state_feat, new_state_pos, dec = self._recurrent_rollout(
                 state_feat,
                 state_pos,
                 feat_i,
@@ -871,17 +995,24 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 update_mask = img_mask
             update_mask = update_mask[:, None, None].float()
-            state_feat = new_state_feat * update_mask + state_feat * (
-                1 - update_mask
+            state_feat = self._blend_state_feat(
+                new_state_feat, state_feat, update_mask
             )  # update global state
+            state_pos = new_state_pos
             mem = new_mem * update_mask + mem * (
                 1 - update_mask
             )  # then update local state
             reset_mask = views[i]["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
-                state_feat = init_state_feat * reset_mask + state_feat * (
-                    1 - reset_mask
+                state_feat = self._blend_state_feat(
+                    init_state_feat, state_feat, reset_mask
+                )
+                state_pos = self._build_state_pos(
+                    state_feat.shape[1],
+                    state_feat.shape[0],
+                    state_feat.device,
+                    state_pos.dtype if state_pos is not None else pos_i.dtype,
                 )
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
             all_state_args.append(
@@ -933,7 +1064,7 @@ class ARCroco3DStereo(CroCoNet):
         else:
             pose_feat_i = None
             pose_pos_i = None
-        new_state_feat, dec = self._recurrent_rollout(
+        new_state_feat, new_state_pos, dec = self._recurrent_rollout(
             state_feat,
             state_pos,
             feat_i,
@@ -1045,7 +1176,7 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 pose_feat_i = None
                 pose_pos_i = None
-            new_state_feat, dec = self._recurrent_rollout(
+            new_state_feat, new_state_pos, dec = self._recurrent_rollout(
                 state_feat,
                 state_pos,
                 feat_i,
@@ -1079,17 +1210,24 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 update_mask = img_mask
             update_mask = update_mask[:, None, None].float()
-            state_feat = new_state_feat * update_mask + state_feat * (
-                1 - update_mask
+            state_feat = self._blend_state_feat(
+                new_state_feat, state_feat, update_mask
             )  # update global state
+            state_pos = new_state_pos
             mem = new_mem * update_mask + mem * (
                 1 - update_mask
             )  # then update local state
             reset_mask = view["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
-                state_feat = init_state_feat * reset_mask + state_feat * (
-                    1 - reset_mask
+                state_feat = self._blend_state_feat(
+                    init_state_feat, state_feat, reset_mask
+                )
+                state_pos = self._build_state_pos(
+                    state_feat.shape[1],
+                    state_feat.shape[0],
+                    state_feat.device,
+                    state_pos.dtype if state_pos is not None else pos_i.dtype,
                 )
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
             all_state_args.append(
