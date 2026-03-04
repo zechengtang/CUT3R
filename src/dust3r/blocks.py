@@ -178,7 +178,15 @@ class Block(nn.Module):
 class CrossAttention(nn.Module):
 
     def __init__(
-        self, dim, rope=None, num_heads=8, qkv_bias=False, attn_drop=0.0, proj_drop=0.0
+        self,
+        dim,
+        rope=None,
+        rope_q=None,
+        rope_k=None,
+        num_heads=8,
+        qkv_bias=False,
+        attn_drop=0.0,
+        proj_drop=0.0,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -193,6 +201,8 @@ class CrossAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.rope = rope.float() if rope is not None else None
+        self.rope_q = rope_q.float() if rope_q is not None else self.rope
+        self.rope_k = rope_k.float() if rope_k is not None else self.rope
 
     def forward(self, query, key, value, qpos, kpos):
         B, Nq, C = query.shape
@@ -217,18 +227,17 @@ class CrossAttention(nn.Module):
 
         q_type = q.dtype
         k_type = k.dtype
-        if self.rope is not None:
-            if qpos is not None:
-                q = q.float()
-                with torch.autocast(device_type="cuda", enabled=False):
-                    q = self.rope(q, qpos)
-                q = q.to(q_type)
+        if self.rope_q is not None and qpos is not None:
+            q = q.float()
+            with torch.autocast(device_type="cuda", enabled=False):
+                q = self.rope_q(q, qpos)
+            q = q.to(q_type)
 
-            if kpos is not None:
-                k = k.float()
-                with torch.autocast(device_type="cuda", enabled=False):
-                    k = self.rope(k, kpos)
-                k = k.to(k_type)
+        if self.rope_k is not None and kpos is not None:
+            k = k.float()
+            with torch.autocast(device_type="cuda", enabled=False):
+                k = self.rope_k(k, kpos)
+            k = k.to(k_type)
 
         x = (
             scaled_dot_product_attention(
@@ -258,6 +267,8 @@ class DecoderBlock(nn.Module):
         norm_layer=nn.LayerNorm,
         norm_mem=True,
         rope=None,
+        cross_rope_q=None,
+        cross_rope_k=None,
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -272,6 +283,8 @@ class DecoderBlock(nn.Module):
         self.cross_attn = CrossAttention(
             dim,
             rope=rope,
+            rope_q=cross_rope_q,
+            rope_k=cross_rope_k,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             attn_drop=attn_drop,
@@ -312,6 +325,8 @@ class CustomDecoderBlock(nn.Module):
         norm_layer=nn.LayerNorm,
         norm_mem=True,
         rope=None,
+        cross_rope_q=None,
+        cross_rope_k=None,
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -326,6 +341,8 @@ class CustomDecoderBlock(nn.Module):
         self.cross_attn = CrossAttention(
             dim,
             rope=rope,
+            rope_q=cross_rope_q,
+            rope_k=cross_rope_k,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             attn_drop=attn_drop,

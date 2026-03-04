@@ -10,6 +10,7 @@
 import numpy as np
 
 import torch
+import torch.nn.functional as F
 
 
 # --------------------------------------------------------
@@ -272,3 +273,67 @@ except ImportError:
             x = self.apply_rope1d(x, positions[:, :, 1], cos, sin, offset)
             tokens = torch.cat((y, x), dim=-1)
             return tokens
+
+
+class RopeA3D(torch.nn.Module):
+    """
+    3D RoPE variant:
+      - x/y follow RoPE2D behavior (split feature dim into two halves).
+      - t uses a different frequency base (freqt) and rotates the full feature dim.
+    """
+
+    def __init__(self, freq=100.0, freqt=50000.0, F0=1.0):
+        super().__init__()
+        self.base_xy = freq
+        self.base_t = freqt
+        self.F0 = F0
+        self.cache = {}
+
+    @staticmethod
+    def rotate_half(x):
+        x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def get_cos_sin(self, D, seq_len, device, dtype, offset, base):
+        key = (D, seq_len, device, dtype, offset, self.F0, base)
+        if key not in self.cache:
+            inv_freq = 1.0 / (
+                base
+                ** (torch.arange(0, D, 2, device=device, dtype=torch.float32) / D)
+            )
+            t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype) - offset
+            freqs = torch.einsum("i,j->ij", t, inv_freq).to(dtype)
+            freqs = self.F0 * freqs
+            freqs = torch.cat((freqs, freqs), dim=-1)
+            self.cache[key] = (freqs.cos(), freqs.sin())
+        return self.cache[key]
+
+    def apply_rope1d(self, tokens, pos1d, base):
+        pos_min = pos1d.min()
+        offset = 0
+        if pos_min < 0:
+            offset = -int(pos_min.item())
+        seq_len = int((pos1d + offset).max().item()) + 1
+        cos, sin = self.get_cos_sin(
+            tokens.shape[-1], seq_len, tokens.device, tokens.dtype, offset, base
+        )
+        pos_adj = (pos1d + offset).long()
+        cos_emb = F.embedding(pos_adj, cos)[:, None, :, :]
+        sin_emb = F.embedding(pos_adj, sin)[:, None, :, :]
+        return tokens * cos_emb + self.rotate_half(tokens) * sin_emb
+
+    def forward(self, tokens, positions):
+        """
+        Args:
+            tokens: [B, nheads, N, D]
+            positions: [B, N, 3] -> (x, y, t)
+        """
+        assert tokens.size(3) % 2 == 0, "Feature dimension should be even."
+        assert positions.ndim == 3 and positions.shape[-1] == 3, "positions must be [B, N, 3]"
+
+        y, x = tokens.chunk(2, dim=-1)
+        y = self.apply_rope1d(y, positions[:, :, 0], self.base_xy)
+        x = self.apply_rope1d(x, positions[:, :, 1], self.base_xy)
+        tokens = torch.cat((y, x), dim=-1)
+        tokens = self.apply_rope1d(tokens, positions[:, :, 2], self.base_t)
+        return tokens
