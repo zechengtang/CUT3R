@@ -99,7 +99,7 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope.float() if rope is not None else None
 
-    def forward(self, x, xpos, return_attn=True):
+    def forward(self, x, xpos, return_attn=False):
         B, N, C = x.shape
 
         qkv = (

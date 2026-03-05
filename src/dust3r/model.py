@@ -1051,7 +1051,8 @@ class ARCroco3DStereo(CroCoNet):
             update_mask = update_mask[:, None, None].float()
 
             # update with learning rate
-            if i  == 0 or reset_mask:
+            reset_mask = views[i]["reset"]
+            if i == 0 or reset_mask:
                 update_mask1 = update_mask
             else:
                 if self.config.model_update_type == "cut3r":
@@ -1071,7 +1072,6 @@ class ARCroco3DStereo(CroCoNet):
                 1 - update_mask2
             )  # then update local state
 
-            reset_mask = views[i]["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
                 state_feat = init_state_feat * reset_mask + state_feat * (
@@ -1299,7 +1299,8 @@ class ARCroco3DStereo(CroCoNet):
             update_mask = update_mask[:, None, None].float()
 
             # update with learning rate
-            if i  == 0 or reset_mask:
+            reset_mask = views[i]["reset"]
+            if i == 0 or reset_mask:
                 update_mask1 = update_mask
             else:
                 if self.config.model_update_type == "cut3r":
@@ -1319,7 +1320,6 @@ class ARCroco3DStereo(CroCoNet):
                 1 - update_mask2
             )  # then update local state
 
-            reset_mask = view["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
                 state_feat = init_state_feat * reset_mask + state_feat * (
