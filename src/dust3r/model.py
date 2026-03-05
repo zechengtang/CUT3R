@@ -966,7 +966,7 @@ class ARCroco3DStereo(CroCoNet):
                 feat_i,
                 pos_i,
             )
-            new_state_feat, new_state_pos, dec = self._recurrent_rollout(
+            new_state_feat, dec = self._recurrent_rollout(
                 state_feat,
                 state_pos,
                 feat_i,
@@ -1000,25 +1000,16 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 update_mask = img_mask
             update_mask = update_mask[:, None, None].float()
-            state_feat = self._blend_state_feat(
-                new_state_feat, state_feat, update_mask
+            state_feat = new_state_feat * update_mask + state_feat * (
+                1 - update_mask
             )  # update global state
-            state_pos = new_state_pos
             mem = new_mem * update_mask + mem * (
                 1 - update_mask
             )  # then update local state
             reset_mask = views[i]["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
-                state_feat = self._blend_state_feat(
-                    init_state_feat, state_feat, reset_mask
-                )
-                state_pos = self._build_state_pos(
-                    state_feat.shape[1],
-                    state_feat.shape[0],
-                    state_feat.device,
-                    state_pos.dtype if state_pos is not None else pos_i.dtype,
-                )
+                state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
             all_state_args.append(
                 (state_feat, state_pos, init_state_feat, mem, init_mem)
@@ -1229,25 +1220,16 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 update_mask = img_mask
             update_mask = update_mask[:, None, None].float()
-            state_feat = self._blend_state_feat(
-                new_state_feat, state_feat, update_mask
+            state_feat = new_state_feat * update_mask + state_feat * (
+                1 - update_mask
             )  # update global state
-            state_pos = new_state_pos
             mem = new_mem * update_mask + mem * (
                 1 - update_mask
             )  # then update local state
             reset_mask = view["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
-                state_feat = self._blend_state_feat(
-                    init_state_feat, state_feat, reset_mask
-                )
-                state_pos = self._build_state_pos(
-                    state_feat.shape[1],
-                    state_feat.shape[0],
-                    state_feat.device,
-                    state_pos.dtype if state_pos is not None else pos_i.dtype,
-                )
+                state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
             all_state_args.append(
                 (state_feat, state_pos, init_state_feat, mem, init_mem)
