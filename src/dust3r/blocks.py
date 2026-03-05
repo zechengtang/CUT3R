@@ -180,7 +180,6 @@ class CrossAttention(nn.Module):
     def __init__(
         self,
         dim,
-        rope=None,
         rope_q=None,
         rope_k=None,
         num_heads=8,
@@ -200,9 +199,8 @@ class CrossAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        self.rope = rope.float() if rope is not None else None
-        self.rope_q = rope_q.float() if rope_q is not None else self.rope
-        self.rope_k = rope_k.float() if rope_k is not None else self.rope
+        self.rope_q = rope_q.float() if rope_q is not None else None
+        self.rope_k = rope_k.float() if rope_k is not None else None
 
     def forward(self, query, key, value, qpos, kpos):
         B, Nq, C = query.shape
@@ -282,7 +280,6 @@ class DecoderBlock(nn.Module):
         )
         self.cross_attn = CrossAttention(
             dim,
-            rope=rope,
             rope_q=cross_rope_q,
             rope_k=cross_rope_k,
             num_heads=num_heads,
@@ -340,7 +337,6 @@ class CustomDecoderBlock(nn.Module):
         )
         self.cross_attn = CrossAttention(
             dim,
-            rope=rope,
             rope_q=cross_rope_q,
             rope_k=cross_rope_k,
             num_heads=num_heads,
