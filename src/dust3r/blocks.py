@@ -99,7 +99,7 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope.float() if rope is not None else None
 
-    def forward(self, x, xpos):
+    def forward(self, x, xpos, return_attn=True):
         B, N, C = x.shape
 
         qkv = (
@@ -120,17 +120,29 @@ class Attention(nn.Module):
             q = q.to(q_type)
             k = k.to(k_type)
 
-        x = (
-            scaled_dot_product_attention(
-                query=q, key=k, value=v, dropout_p=self.attn_drop.p, scale=self.scale
-            )
-            .transpose(1, 2)
-            .reshape(B, N, C)
-        )
+        if return_attn:
+            # original attention
+            attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, Nq, Nk] [1, 16, 768, 1 + 576]
+            attn_before_softmax = attn.detach().clone()
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C) # [B, N, C] [1, 768, 768]
 
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x, attn_before_softmax
+        else:
+            x = (
+                scaled_dot_product_attention(
+                    query=q, key=k, value=v, dropout_p=self.attn_drop.p, scale=self.scale
+                )
+                .transpose(1, 2)
+                .reshape(B, N, C)
+            )
+
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x
 
 
 class Block(nn.Module):
@@ -202,7 +214,7 @@ class CrossAttention(nn.Module):
         self.rope_q = rope_q.float() if rope_q is not None else None
         self.rope_k = rope_k.float() if rope_k is not None else None
 
-    def forward(self, query, key, value, qpos, kpos):
+    def forward(self, query, key, value, qpos, kpos, return_attn=True):
         B, Nq, C = query.shape
         Nk = key.shape[1]
         Nv = value.shape[1]
@@ -237,17 +249,32 @@ class CrossAttention(nn.Module):
                 k = self.rope_k(k, kpos)
             k = k.to(k_type)
 
-        x = (
-            scaled_dot_product_attention(
-                query=q, key=k, value=v, dropout_p=self.attn_drop.p, scale=self.scale
-            )
-            .transpose(1, 2)
-            .reshape(B, Nq, C)
-        )
+        if return_attn:
+            # original attention
+            attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, Nq, Nk] [1, 16, 768, 1 + 576]
+            attn_before_softmax = attn.detach().clone()
 
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = (attn @ v).transpose(1, 2).reshape(B, Nq, C) # [B, Nq, C] [1, 768, 768]
+
+            x = self.proj(x)
+            x = self.proj_drop(x)
+
+            return x, attn_before_softmax
+        else:
+            x = (
+                scaled_dot_product_attention(
+                    query=q, key=k, value=v, dropout_p=self.attn_drop.p, scale=self.scale
+                )
+                .transpose(1, 2)
+                .reshape(B, Nq, C)
+            ) # [B, Nq, C] [1, 768, 768]
+
+            x = self.proj(x)
+            x = self.proj_drop(x)
+
+            return x
 
 
 class DecoderBlock(nn.Module):
@@ -299,12 +326,21 @@ class DecoderBlock(nn.Module):
         )
         self.norm_y = norm_layer(dim) if norm_mem else nn.Identity()
 
-    def forward(self, x, y, xpos, ypos):
-        x = x + self.drop_path(self.attn(self.norm1(x), xpos))
-        y_ = self.norm_y(y)
-        x = x + self.drop_path(self.cross_attn(self.norm2(x), y_, y_, xpos, ypos))
-        x = x + self.drop_path(self.mlp(self.norm3(x)))
-        return x, y
+    def forward(self, x, y, xpos, ypos, return_attn=True):
+        if return_attn:
+            self_attn_output, self_attn = self.attn(self.norm1(x), xpos, return_attn=True)
+            x = x + self.drop_path(self_attn_output)
+            y_ = self.norm_y(y)
+            cross_attn_output, cross_attn = self.cross_attn(self.norm2(x), y_, y_, xpos, ypos, return_attn=True)
+            x = x + self.drop_path(cross_attn_output)
+            x = x + self.drop_path(self.mlp(self.norm3(x)))
+            return x, y, self_attn, cross_attn
+        else:
+            x = x + self.drop_path(self.attn(self.norm1(x), xpos))
+            y_ = self.norm_y(y)
+            x = x + self.drop_path(self.cross_attn(self.norm2(x), y_, y_, xpos, ypos))
+            x = x + self.drop_path(self.mlp(self.norm3(x)))
+            return x, y, None, None
 
 
 class CustomDecoderBlock(nn.Module):
