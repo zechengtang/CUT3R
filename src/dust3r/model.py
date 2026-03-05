@@ -28,6 +28,7 @@ from dust3r.utils.camera import PoseEncoder
 from dust3r.patch_embed import get_patch_embed
 import dust3r.utils.path_to_croco  # noqa: F401
 from models.croco import CroCoNet, CrocoConfig  # noqa
+from models.pos_embed import RopeA3D
 from dust3r.blocks import (
     Block,
     DecoderBlock,
@@ -281,6 +282,10 @@ class ARCroco3DStereo(CroCoNet):
         self.frame_state_size = config.frame_state_size
         self.frame_state_mode = config.frame_state_mode
         self.state_pe = config.state_pe
+        rope_freq = 100.0
+        if isinstance(self.pos_embed, str) and self.pos_embed.startswith("RoPE"):
+            rope_freq = float(self.pos_embed[len("RoPE") :])
+        self.state_rope = RopeA3D(freq=rope_freq, freqt=50000.0)
         if self.frame_state_mode in ["image", "state"]:
             self.frame_state_dec = DecoderBlock(
                 self.dec_embed_dim,
@@ -289,7 +294,9 @@ class ARCroco3DStereo(CroCoNet):
                 qkv_bias=True,
                 norm_layer=self.croco_args.get("norm_layer", None),
                 norm_mem=self.croco_args.get("norm_im2_in_dec", None),
-                rope=self.rope,
+                rope=self.state_rope,
+                cross_rope_q=self.state_rope,
+                cross_rope_k=None,
             )
         else:
             self.frame_state_dec = nn.Identity()
@@ -369,6 +376,8 @@ class ARCroco3DStereo(CroCoNet):
                     norm_layer=norm_layer,
                     norm_mem=norm_im2_in_dec,
                     rope=self.rope,
+                    cross_rope_q=self.rope,
+                    cross_rope_k=self.state_rope,
                 )
                 for i in range(dec_depth)
             ]
@@ -397,7 +406,9 @@ class ARCroco3DStereo(CroCoNet):
                     qkv_bias=True,
                     norm_layer=norm_layer,
                     norm_mem=norm_im2_in_dec,
-                    rope=self.rope,
+                    rope=self.state_rope,
+                    cross_rope_q=self.state_rope,
+                    cross_rope_k=self.rope,
                 )
                 for i in range(dec_depth)
             ]
@@ -587,7 +598,7 @@ class ARCroco3DStereo(CroCoNet):
             if self.state_pe == "3d":
                 state_pos = (
                     torch.tensor(
-                        [[time_step, i // width, i % width] for i in range(size)],
+                        [[i // width, i % width, time_step] for i in range(size)],
                         dtype=dtype,
                         device=device,
                     )[None]
@@ -629,12 +640,11 @@ class ARCroco3DStereo(CroCoNet):
             state_pos.dtype if state_pos is not None else current_pos.dtype,
             time_step=0,
         )
-
         if state_pos is None:
             state_pos_for_dec = None
         elif self.state_pe == "3d":
             state_pos_for_dec = state_pos.clone()
-            state_pos_for_dec[..., 0] = state_pos_for_dec[..., 0] + 1
+            state_pos_for_dec[..., 2] = state_pos_for_dec[..., 2] + 1
         else:
             state_pos_for_dec = state_pos
 
@@ -779,7 +789,11 @@ class ARCroco3DStereo(CroCoNet):
                     use_reentrant=not self.fixed_input_length,
                 )
             else:
-                f_state, _ = blk_state(*final_output[-1][::+1], pos_state, pos_img)
+                f_state, _ = blk_state(
+                    *final_output[-1][::+1],
+                    pos_state,
+                    pos_img,
+                )
                 f_img, _ = blk_img(*final_output[-1][::-1], pos_img, pos_state)
             final_output.append((f_state, f_img))
         del final_output[1]  # duplicate with final_output[0]
