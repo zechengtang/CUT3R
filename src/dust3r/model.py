@@ -16,6 +16,7 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.file_utils import ModelOutput
 import time
+from einops import rearrange
 from dust3r.utils.misc import (
     fill_default_args,
     freeze_all_params,
@@ -118,6 +119,7 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         rgb_head=False,
         pose_conf_head=False,
         pose_head=False,
+        model_update_type="ttt3r",
         **croco_kwargs,
     ):
         super().__init__()
@@ -141,6 +143,7 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.rgb_head = rgb_head
         self.pose_conf_head = pose_conf_head
         self.pose_head = pose_head
+        self.model_update_type = model_update_type
         self.croco_kwargs = croco_kwargs
 
 
@@ -167,10 +170,10 @@ class LocalMemory(nn.Module):
         self.proj_q = nn.Linear(k_dim, v_dim)
         self.masked_token = nn.Parameter(
             torch.randn(1, 1, v_dim) * 0.2, requires_grad=True
-        )
+        ) # [1, 1, 768] pose mask token
         self.mem = nn.Parameter(
             torch.randn(1, size, 2 * v_dim) * 0.2, requires_grad=True
-        )
+        ) # [1, 256, 1536] pose mem
         self.write_blocks = nn.ModuleList(
             [
                 DecoderBlock(
@@ -208,24 +211,29 @@ class LocalMemory(nn.Module):
             ]
         )
 
-    def update_mem(self, mem, feat_k, feat_v):
+    def update_mem(self, mem, feat_k, feat_v, return_attn=False):
         """
         mem_k: [B, size, C]
         mem_v: [B, size, C]
-        feat_k: [B, 1, C]
-        feat_v: [B, 1, C]
+        feat_k: [B, 1, C] global_img_feat
+        feat_v: [B, 1, C] out_pose_feat
         """
         feat_k = self.proj_q(feat_k)  # [B, 1, C]
         feat = torch.cat([feat_k, feat_v], dim=-1)
+
+        attention_maps = []
         for blk in self.write_blocks:
-            mem, _ = blk(mem, feat, None, None)
+            mem, _, self_attn, cross_attn = blk(mem, feat, None, None, return_attn=return_attn)
+            attention_maps.append((self_attn, cross_attn))
         return mem
 
-    def inquire(self, query, mem):
+    def inquire(self, query, mem, return_attn=False):
         x = self.proj_q(query)  # [B, 1, C]
-        x = torch.cat([x, self.masked_token.expand(x.shape[0], -1, -1)], dim=-1)
+        x = torch.cat([x, self.masked_token.expand(x.shape[0], -1, -1)], dim=-1) # [1, 1, 768 global_img_feat_i + 768 masked_token(pose)]
+        attention_maps = []
         for blk in self.read_blocks:
-            x, _ = blk(x, mem, None, None)
+            x, _, self_attn, cross_attn = blk(x, mem, None, None, return_attn=return_attn)
+            attention_maps.append((self_attn, cross_attn))
         return x[..., -self.v_dim :]
 
 
@@ -781,7 +789,7 @@ class ARCroco3DStereo(CroCoNet):
             full_pos.chunk(len(views), dim=0),
         )
 
-    def _decoder(self, f_state, pos_state, f_img, pos_img, f_pose, pos_pose):
+    def _decoder(self, f_state, pos_state, f_img, pos_img, f_pose, pos_pose, return_attn):
         assert f_state.shape[-1] == self.dec_embed_dim
         assert f_img.shape[-1] == self.dec_embed_dim
         if self.pose_head_flag:
@@ -789,35 +797,44 @@ class ARCroco3DStereo(CroCoNet):
             f_img = torch.cat([f_pose, f_img], dim=1)
             pos_img = torch.cat([pos_pose, pos_img], dim=1)
         final_output = [(f_state, f_img)]
+        attention_maps = []
         for blk_state, blk_img in zip(self.dec_blocks_state, self.dec_blocks):
             if (
                 self.gradient_checkpointing
                 and self.training
                 and torch.is_grad_enabled()
             ):
-                f_state, _ = checkpoint(
+                f_state, _, self_attn_state, cross_attn_state = checkpoint(
                     blk_state,
                     *final_output[-1][::+1],
                     pos_state,
                     pos_img,
+                    return_attn,
                     use_reentrant=not self.fixed_input_length,
                 )
-                f_img, _ = checkpoint(
+                f_img, _, self_attn_img, cross_attn_img = checkpoint(
                     blk_img,
                     *final_output[-1][::-1],
                     pos_img,
                     pos_state,
+                    return_attn,
                     use_reentrant=not self.fixed_input_length,
                 )
             else:
-                f_state, _ = blk_state(*final_output[-1][::+1], pos_state, pos_img)
-                f_img, _ = blk_img(*final_output[-1][::-1], pos_img, pos_state)
+                f_state, _, self_attn_state, cross_attn_state = blk_state(
+                    *final_output[-1][::+1], pos_state, pos_img, 
+                    return_attn=return_attn)
+                f_img, _, self_attn_img, cross_attn_img = blk_img(
+                    *final_output[-1][::-1], pos_img, pos_state, 
+                    return_attn=return_attn)
             final_output.append((f_state, f_img))
+            attention_maps.append(
+                (self_attn_state, cross_attn_state, self_attn_img, cross_attn_img))
         final_output[-1] = (
             self.dec_norm_state(final_output[-1][0]),
             self.dec_norm(final_output[-1][1]),
         )
-        return zip(*final_output)
+        return zip(*final_output), zip(*attention_maps)
 
     def _downstream_head(self, decout, img_shape, **kwargs):
         B, S, D = decout[-1].shape
@@ -836,12 +853,17 @@ class ARCroco3DStereo(CroCoNet):
         img_mask=None,
         reset_mask=None,
         update=None,
+        return_attn=True,
     ):
-        new_state_feat, dec = self._decoder(
-            state_feat, state_pos, current_feat, current_pos, pose_feat, pose_pos
+        (new_state_feat, dec), (
+            self_attn_state, cross_attn_state, self_attn_img, cross_attn_img
+        ) = self._decoder(
+            state_feat, state_pos, current_feat, current_pos, pose_feat, pose_pos,
+            return_attn=return_attn,
         )
         new_state_feat = new_state_feat[-1]
-        return new_state_feat, dec
+        return (new_state_feat, dec), ( 
+                self_attn_state, cross_attn_state, self_attn_img, cross_attn_img)
 
     def _get_img_level_feat(self, feat):
         return torch.mean(feat, dim=1, keepdim=True)
@@ -895,7 +917,9 @@ class ARCroco3DStereo(CroCoNet):
             feat_i,
             pos_i,
         )
-        new_state_feat, dec = self._recurrent_rollout(
+        (new_state_feat, dec), (
+            self_attn_state, cross_attn_state, self_attn_img, cross_attn_img
+        ) = self._recurrent_rollout(
             state_feat,
             state_pos,
             feat_i,
@@ -906,6 +930,7 @@ class ARCroco3DStereo(CroCoNet):
             img_mask=views[i]["img_mask"],
             reset_mask=views[i]["reset"],
             update=views[i].get("update", None),
+            return_attn=True,
         )
         out_pose_feat_i = dec[-1][:, 0:1]
         new_mem = self.pose_retriever.update_mem(
@@ -925,10 +950,28 @@ class ARCroco3DStereo(CroCoNet):
         else:
             update_mask = img_mask
         update_mask = update_mask[:, None, None].float()
-        state_feat = new_state_feat * update_mask + state_feat * (
-            1 - update_mask
+
+        # update with learning rate
+        if i  == 0:
+            update_mask1 = update_mask
+        else:
+            if self.config.model_update_type == "cut3r":
+                update_mask1 = update_mask
+            elif self.config.model_update_type == "ttt3r":
+                cross_attn_state = rearrange(torch.cat(cross_attn_state, dim=0), 'l h nstate nimg -> 1 nstate nimg (l h)') # [12, 16, 768, 1 + 576] -> [1, 768, 1 + 576, 12*16]
+                state_query_img_key = cross_attn_state.mean(dim=(-1, -2))
+                update_mask1 = update_mask * torch.sigmoid(state_query_img_key)[..., None] * 1.0
+            else:
+                raise ValueError(f"Invalid model type: {self.config.model_update_type}")
+
+        update_mask2 = update_mask
+        state_feat = new_state_feat * update_mask1 + state_feat * (
+            1 - update_mask1
         )  # update global state
-        mem = new_mem * update_mask + mem * (1 - update_mask)  # then update local state
+        mem = new_mem * update_mask2 + mem * (
+            1 - update_mask2
+        )  # then update local state
+
         reset_mask = views[i]["reset"]
         if reset_mask is not None:
             reset_mask = reset_mask[:, None, None].float()
@@ -969,7 +1012,9 @@ class ARCroco3DStereo(CroCoNet):
                 feat_i,
                 pos_i,
             )
-            new_state_feat, dec = self._recurrent_rollout(
+            (new_state_feat, dec), (
+                self_attn_state, cross_attn_state, self_attn_img, cross_attn_img
+            ) = self._recurrent_rollout(
                 state_feat,
                 state_pos,
                 feat_i,
@@ -980,6 +1025,7 @@ class ARCroco3DStereo(CroCoNet):
                 img_mask=views[i]["img_mask"],
                 reset_mask=views[i]["reset"],
                 update=views[i].get("update", None),
+                return_attn=True,
             )
             out_pose_feat_i = dec[-1][:, 0:1]
             new_mem = self.pose_retriever.update_mem(
@@ -1003,12 +1049,28 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 update_mask = img_mask
             update_mask = update_mask[:, None, None].float()
-            state_feat = new_state_feat * update_mask + state_feat * (
-                1 - update_mask
+
+            # update with learning rate
+            if i  == 0 or reset_mask:
+                update_mask1 = update_mask
+            else:
+                if self.config.model_update_type == "cut3r":
+                    update_mask1 = update_mask
+                elif self.config.model_update_type == "ttt3r":
+                    cross_attn_state = rearrange(torch.cat(cross_attn_state, dim=0), 'l h nstate nimg -> 1 nstate nimg (l h)') # [12, 16, 768, 1 + 576] -> [1, 768, 1 + 576, 12*16]
+                    state_query_img_key = cross_attn_state.mean(dim=(-1, -2))
+                    update_mask1 = update_mask * torch.sigmoid(state_query_img_key)[..., None] * 1.0
+                else:
+                    raise ValueError(f"Invalid model type: {self.config.model_update_type}")
+            update_mask2 = update_mask
+
+            state_feat = new_state_feat * update_mask1 + state_feat * (
+                1 - update_mask1
             )  # update global state
-            mem = new_mem * update_mask + mem * (
-                1 - update_mask
+            mem = new_mem * update_mask2 + mem * (
+                1 - update_mask2
             )  # then update local state
+
             reset_mask = views[i]["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
@@ -1074,7 +1136,9 @@ class ARCroco3DStereo(CroCoNet):
             feat_i,
             pos_i,
         )
-        new_state_feat, dec = self._recurrent_rollout(
+        (new_state_feat, dec), (
+            self_attn_state, cross_attn_state, self_attn_img, cross_attn_img
+        ) = self._recurrent_rollout(
             state_feat,
             state_pos,
             feat_i,
@@ -1085,6 +1149,7 @@ class ARCroco3DStereo(CroCoNet):
             img_mask=view["img_mask"],
             reset_mask=view["reset"],
             update=view.get("update", None),
+            return_attn=True,
         )
 
         out_pose_feat_i = dec[-1][:, 0:1]
@@ -1195,7 +1260,9 @@ class ARCroco3DStereo(CroCoNet):
                 feat_i,
                 pos_i,
             )
-            new_state_feat, dec = self._recurrent_rollout(
+            (new_state_feat, dec), (
+                self_attn_state, cross_attn_state, self_attn_img, cross_attn_img
+            ) = self._recurrent_rollout(
                 state_feat,
                 state_pos,
                 feat_i,
@@ -1206,6 +1273,7 @@ class ARCroco3DStereo(CroCoNet):
                 img_mask=view["img_mask"],
                 reset_mask=view["reset"],
                 update=view.get("update", None),
+                return_attn=True,
             )
             out_pose_feat_i = dec[-1][:, 0:1]
             new_mem = self.pose_retriever.update_mem(
@@ -1229,12 +1297,28 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 update_mask = img_mask
             update_mask = update_mask[:, None, None].float()
-            state_feat = new_state_feat * update_mask + state_feat * (
-                1 - update_mask
+
+            # update with learning rate
+            if i  == 0 or reset_mask:
+                update_mask1 = update_mask
+            else:
+                if self.config.model_update_type == "cut3r":
+                    update_mask1 = update_mask
+                elif self.config.model_update_type == "ttt3r":
+                    cross_attn_state = rearrange(torch.cat(cross_attn_state, dim=0), 'l h nstate nimg -> 1 nstate nimg (l h)') # [12, 16, 768, 1 + 576] -> [1, 768, 1 + 576, 12*16]
+                    state_query_img_key = cross_attn_state.mean(dim=(-1, -2))
+                    update_mask1 = update_mask * torch.sigmoid(state_query_img_key)[..., None] * 1.0
+                else:
+                    raise ValueError(f"Invalid model type: {self.config.model_update_type}")
+            update_mask2 = update_mask
+
+            state_feat = new_state_feat * update_mask1 + state_feat * (
+                1 - update_mask1
             )  # update global state
-            mem = new_mem * update_mask + mem * (
-                1 - update_mask
+            mem = new_mem * update_mask2 + mem * (
+                1 - update_mask2
             )  # then update local state
+
             reset_mask = view["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
