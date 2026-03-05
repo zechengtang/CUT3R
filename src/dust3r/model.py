@@ -646,7 +646,7 @@ class ARCroco3DStereo(CroCoNet):
         )
 
         if self.state_pe == '3d':
-            time_step = int(state_pos.max().item())
+            time_step = int(state_pos[:, :, 2].max().item()) + 1
             frame_pos = self._build_state_pos(
                 self.frame_state_size,
                 batch_size,
