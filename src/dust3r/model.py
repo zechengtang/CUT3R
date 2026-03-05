@@ -517,6 +517,28 @@ class ARCroco3DStereo(CroCoNet):
                 self.pose_token,
                 self.frame_state_dec,
             ],
+            "all_except_fstate": [
+                self.patch_embed,
+                self.patch_embed_ray_map,
+                self.masked_img_token,
+                self.masked_ray_map_token,
+                self.enc_blocks,
+                self.enc_blocks_ray_map,
+                self.enc_norm,
+                self.enc_norm_ray_map,
+
+                self.downstream_head,
+
+                self.dec_blocks,
+                self.dec_blocks_state,
+                self.pose_retriever,
+                self.pose_token,
+                self.register_tokens,
+                self.decoder_embed_state,
+                self.decoder_embed,
+                self.dec_norm,
+                self.dec_norm_state,
+            ]
         }
         freeze_all_params(to_be_frozen[freeze])
 
