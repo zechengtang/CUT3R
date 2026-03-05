@@ -243,6 +243,11 @@ class ARCroco3DStereo(CroCoNet):
         self.config = config
         self.patch_embed_cls = config.patch_embed_cls
         self.croco_args = config.croco_kwargs
+        self.state_pe = config.state_pe
+        if self.state_pe == '3d':
+            self.state_rope = RopeA3D(freq=self.rope.base, freqt=config.state_freqt)
+        else:
+            self.state_rope = self.rope
         croco_cfg = CrocoConfig(**self.croco_args)
         super().__init__(croco_cfg)
         self.enc_blocks_ray_map = nn.ModuleList(
@@ -283,8 +288,6 @@ class ARCroco3DStereo(CroCoNet):
         self.state_size = config.state_size
         self.frame_state_size = config.frame_state_size
         self.frame_state_mode = config.frame_state_mode
-        self.state_pe = config.state_pe
-        self.state_rope = RopeA3D(freq=self.rope.base, freqt=config.state_freqt)
         if self.frame_state_mode == "image":
             self.frame_state_dec = DecoderBlock(
                 self.dec_embed_dim,
